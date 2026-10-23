@@ -1,0 +1,7 @@
+[package]
+name = "basilisk"
+version = "0.1.0"
+edition = "2021"
+description = "Single-producer single-consumer lock-free ring-buffer queue"
+
+[dependencies]
