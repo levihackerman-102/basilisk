@@ -10,7 +10,8 @@ use std::error::Error;
 use std::fmt;
 use std::mem::{self, MaybeUninit};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Aligns (and therefore pads) `T` to its own cache line.
 ///
@@ -74,8 +75,6 @@ impl<T> Error for Full<T> {}
 ///
 /// Ownership of a slot is handed back and forth through the counters: only the
 /// producer writes `head` and only the consumer writes `tail`.
-// TODO(step 4): drop this allow once `Producer`/`Consumer` use it.
-#[allow(dead_code)]
 struct Ring<T, const N: usize> {
     buf: Box<[UnsafeCell<MaybeUninit<T>>]>,
     /// Next position to write; written only by the producer.
@@ -85,7 +84,7 @@ struct Ring<T, const N: usize> {
 }
 
 // SAFETY: a `Ring` is only accessed through the single `Producer` and single
-// `Consumer` handles (step 4). They never touch the same slot at the same time:
+// `Consumer` handles. They never touch the same slot at the same time:
 // a slot is written by the producer before it publishes `head` with `Release`,
 // and read by the consumer only after it observes that `head` with `Acquire`;
 // symmetrically the producer reuses a slot only after observing the consumer's
@@ -93,7 +92,6 @@ struct Ring<T, const N: usize> {
 unsafe impl<T: Send, const N: usize> Send for Ring<T, N> {}
 unsafe impl<T: Send, const N: usize> Sync for Ring<T, N> {}
 
-#[allow(dead_code)]
 impl<T, const N: usize> Ring<T, N> {
     /// Bitmask turning a position into a slot index. Evaluating it rejects, at
     /// compile time, any `N` that is not a power of two (including 0).
@@ -149,13 +147,99 @@ impl<T, const N: usize> Drop for Ring<T, N> {
     }
 }
 
+/// Creates a queue of exactly `N` slots and returns its two ends.
+///
+/// `N` must be a power of two; any other value fails to compile.
+///
+/// ```compile_fail
+/// let _ = basilisk::channel::<u64, 3>();
+/// ```
+pub fn channel<T, const N: usize>() -> (Producer<T, N>, Consumer<T, N>) {
+    let ring = Arc::new(Ring::new());
+    (
+        Producer {
+            ring: Arc::clone(&ring),
+            cached_tail: 0,
+        },
+        Consumer {
+            ring,
+            cached_head: 0,
+        },
+    )
+}
+
+/// The sending end of the queue. Not `Clone`: there is exactly one producer.
+///
+/// ```compile_fail
+/// let (tx, _rx) = basilisk::channel::<u64, 4>();
+/// let _ = tx.clone();
+/// ```
+pub struct Producer<T, const N: usize> {
+    ring: Arc<Ring<T, N>>,
+    /// Last observed value of the consumer's `tail`; only ever lags behind it.
+    cached_tail: usize,
+}
+
+impl<T, const N: usize> Producer<T, N> {
+    /// Appends `item`, or hands it back as `Err(Full(item))` if the queue is full.
+    pub fn push(&mut self, item: T) -> Result<(), Full<T>> {
+        // Only this handle writes `head`, so a relaxed read of it is exact.
+        let head = self.ring.head.load(Ordering::Relaxed);
+        if head.wrapping_sub(self.cached_tail) == N {
+            // Looks full: refresh. `Acquire` pairs with the consumer's `Release`
+            // store of `tail`, so its read of a slot happens-before our reuse of it.
+            self.cached_tail = self.ring.tail.load(Ordering::Acquire);
+            if head.wrapping_sub(self.cached_tail) == N {
+                return Err(Full(item));
+            }
+        }
+        // SAFETY: `head - tail < N`, so the slot at `head` lies outside
+        // `tail..head`: it is uninitialised and the consumer will not touch it
+        // until we publish the new `head` below.
+        unsafe { self.ring.write(head, item) };
+        self.ring
+            .head
+            .store(head.wrapping_add(1), Ordering::Release);
+        Ok(())
+    }
+}
+
+/// The receiving end of the queue. Not `Clone`: there is exactly one consumer.
+pub struct Consumer<T, const N: usize> {
+    ring: Arc<Ring<T, N>>,
+    /// Last observed value of the producer's `head`; only ever lags behind it.
+    cached_head: usize,
+}
+
+impl<T, const N: usize> Consumer<T, N> {
+    /// Removes and returns the oldest item, or `None` if the queue is empty.
+    pub fn pop(&mut self) -> Option<T> {
+        // Only this handle writes `tail`, so a relaxed read of it is exact.
+        let tail = self.ring.tail.load(Ordering::Relaxed);
+        if tail == self.cached_head {
+            // Looks empty: refresh. `Acquire` pairs with the producer's `Release`
+            // store of `head`, making the slot contents visible to us.
+            self.cached_head = self.ring.head.load(Ordering::Acquire);
+            if tail == self.cached_head {
+                return None;
+            }
+        }
+        // SAFETY: `tail != head`, so the slot at `tail` is initialised, and the
+        // producer will not reuse it until we publish the new `tail` below.
+        let item = unsafe { self.ring.read(tail) };
+        self.ring
+            .tail
+            .store(tail.wrapping_add(1), Ordering::Release);
+        Some(item)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
     use std::mem::{align_of, size_of};
     use std::rc::Rc;
-    use std::sync::atomic::Ordering;
 
     #[test]
     fn cache_padded_occupies_whole_lines() {
@@ -282,5 +366,124 @@ mod tests {
         let drops = Rc::new(Cell::new(0));
         drop(filled_ring::<1>(7, 1, &drops));
         assert_eq!(drops.get(), 1);
+    }
+
+    /// Like `channel`, but with all four counters starting at `start`.
+    fn channel_at<T, const N: usize>(start: usize) -> (Producer<T, N>, Consumer<T, N>) {
+        let (mut tx, mut rx) = channel::<T, N>();
+        tx.ring.head.store(start, Ordering::Relaxed);
+        tx.ring.tail.store(start, Ordering::Relaxed);
+        tx.cached_tail = start;
+        rx.cached_head = start;
+        (tx, rx)
+    }
+
+    #[test]
+    fn pop_on_empty_returns_none() {
+        let (mut tx, mut rx) = channel::<u32, 4>();
+        assert_eq!(rx.pop(), None);
+        tx.push(1).unwrap();
+        assert_eq!(rx.pop(), Some(1));
+        assert_eq!(rx.pop(), None);
+    }
+
+    #[test]
+    fn fifo_order() {
+        let (mut tx, mut rx) = channel::<u32, 8>();
+        for i in 0..8 {
+            tx.push(i).unwrap();
+        }
+        for i in 0..8 {
+            assert_eq!(rx.pop(), Some(i));
+        }
+    }
+
+    #[test]
+    fn push_on_full_returns_the_item() {
+        let (mut tx, mut rx) = channel::<String, 4>();
+        for i in 0..4 {
+            tx.push(i.to_string()).unwrap(); // all N slots are usable
+        }
+        let err = tx.push("extra".to_string()).unwrap_err();
+        assert_eq!(err.into_inner(), "extra");
+        assert_eq!(rx.pop().as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn push_succeeds_again_after_pop() {
+        let (mut tx, mut rx) = channel::<u32, 2>();
+        tx.push(1).unwrap();
+        tx.push(2).unwrap();
+        assert!(tx.push(3).is_err());
+        assert_eq!(rx.pop(), Some(1));
+        tx.push(3).unwrap(); // must refresh the stale cached tail
+        assert_eq!(rx.pop(), Some(2));
+        assert_eq!(rx.pop(), Some(3));
+    }
+
+    #[test]
+    fn many_laps_around_the_ring() {
+        let (mut tx, mut rx) = channel::<usize, 4>();
+        for i in 0..40 {
+            tx.push(i).unwrap();
+            tx.push(i + 1000).unwrap();
+            assert_eq!(rx.pop(), Some(i));
+            assert_eq!(rx.pop(), Some(i + 1000));
+        }
+        assert_eq!(rx.pop(), None);
+    }
+
+    #[test]
+    fn counters_wrap_past_usize_max() {
+        let (mut tx, mut rx) = channel_at::<u32, 4>(usize::MAX - 2);
+        for round in 0..10u32 {
+            for i in 0..4 {
+                tx.push(round * 10 + i).unwrap();
+            }
+            assert!(tx.push(99).is_err());
+            for i in 0..4 {
+                assert_eq!(rx.pop(), Some(round * 10 + i));
+            }
+            assert_eq!(rx.pop(), None);
+        }
+    }
+
+    #[test]
+    fn capacity_one() {
+        let (mut tx, mut rx) = channel::<u8, 1>();
+        for i in 0..5 {
+            tx.push(i).unwrap();
+            assert!(tx.push(0).is_err());
+            assert_eq!(rx.pop(), Some(i));
+            assert_eq!(rx.pop(), None);
+        }
+    }
+
+    #[test]
+    fn dropping_handles_drops_unpopped_items_once() {
+        for producer_first in [true, false] {
+            let drops = Rc::new(Cell::new(0));
+            let (mut tx, mut rx) = channel::<Tracked, 4>();
+            for _ in 0..3 {
+                tx.push(Tracked(drops.clone())).ok().unwrap();
+            }
+            drop(rx.pop());
+            assert_eq!(drops.get(), 1);
+            if producer_first {
+                drop(tx);
+                drop(rx);
+            } else {
+                drop(rx);
+                drop(tx);
+            }
+            assert_eq!(drops.get(), 3);
+        }
+    }
+
+    #[test]
+    fn handles_are_send() {
+        fn assert_send<X: Send>() {}
+        assert_send::<Producer<Box<u64>, 8>>();
+        assert_send::<Consumer<Box<u64>, 8>>();
     }
 }
