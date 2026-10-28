@@ -4,6 +4,35 @@
 //! ring buffer. Synchronisation uses only atomics (`Acquire`/`Release`); there
 //! are no mutexes, read-write locks, or condition variables. A full queue
 //! rejects pushes with `Err(Full(item))` and an empty queue yields `None`.
+//!
+//! # Memory ordering
+//!
+//! Each counter has a single writer: only the producer writes `head`, only
+//! the consumer writes `tail`. A slot changes hands through those counters.
+//!
+//! * **Publish with `Release`.** `push` writes the slot, then stores `head`
+//!   with `Release`; `pop` reads the slot, then stores `tail` with `Release`.
+//!   Everything done to the slot before the store is ordered before it.
+//! * **Observe with `Acquire`.** A side that loads the *other* side's counter
+//!   uses `Acquire`. If it sees the new value, it also sees the slot
+//!   contents (consumer) or knows the slot has been fully read (producer).
+//! * **`Relaxed` for your own counter.** A side re-reading the counter it
+//!   alone writes needs no synchronisation, so that load is `Relaxed`.
+//!
+//! The producer's refresh of `tail` is `Acquire` on purpose, not `Relaxed`.
+//! The consumer's read of a slot must happen-before the producer overwrites
+//! it, and that needs the `Release` store of `tail` to pair with an `Acquire`
+//! load. With `Relaxed`, the producer could reuse a slot the consumer is
+//! still reading.
+//!
+//! Each handle also caches the other counter and re-loads it only when the
+//! queue looks full or empty, which keeps the two cache lines from bouncing
+//! between cores on every operation.
+//!
+//! Slot access uses ordinary bounds-checked indexing. Swapping in
+//! `get_unchecked` made no measurable difference in `examples/bench.rs`
+//! (run-to-run noise from core placement was larger than any gap), so the
+//! safe form stays.
 
 use std::cell::UnsafeCell;
 use std::error::Error;
